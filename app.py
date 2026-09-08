@@ -10,29 +10,25 @@ from pypdf import PdfWriter, PdfReader
 
 app = Flask(__name__)
 
-# Security: Simple API key (change this to your own secret)
+# Security API key
 API_KEY = "ayra_secret_key_2026"
 
 
 def check_auth():
     key = request.headers.get("X-API-Key", "")
-    if key != API_KEY:
-        return False
-    return True
+    return key == API_KEY
 
 
 def fill_docx(docx_path, replacements, output_path):
     """Fill a DOCX template with replacement values preserving all formatting"""
     doc = Document(docx_path)
-
-    # Sort replacements by key length (longest first) to prevent partial matches
     sorted_keys = sorted(replacements.keys(), key=len, reverse=True)
 
     # Fill paragraphs
     for para in doc.paragraphs:
         for key in sorted_keys:
             if key in para.text:
-                value = replacements[key] or ""
+                value = str(replacements[key] or "")
                 for run in para.runs:
                     if key in run.text:
                         run.text = run.text.replace(key, value)
@@ -44,7 +40,7 @@ def fill_docx(docx_path, replacements, output_path):
                 for para in cell.paragraphs:
                     for key in sorted_keys:
                         if key in para.text:
-                            value = replacements[key] or ""
+                            value = str(replacements[key] or "")
                             for run in para.runs:
                                 if key in run.text:
                                     run.text = run.text.replace(key, value)
@@ -53,10 +49,11 @@ def fill_docx(docx_path, replacements, output_path):
 
 
 def convert_docx_to_pdf(docx_path, pdf_path):
-    """Convert DOCX to PDF using LibreOffice headless"""
+    """Convert DOCX to PDF using LibreOffice headless in Docker"""
     output_dir = os.path.dirname(pdf_path)
     cmd = [
         "libreoffice",
+        "-env:UserInstallation=file:///tmp/lo_profile",
         "--headless",
         "--norestore",
         "--nofirststartwizard",
@@ -64,7 +61,9 @@ def convert_docx_to_pdf(docx_path, pdf_path):
         "--outdir", output_dir,
         docx_path
     ]
-    subprocess.run(cmd, timeout=60, check=True, capture_output=True)
+    res = subprocess.run(cmd, timeout=60, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"LibreOffice failed ({res.returncode}): {res.stderr}")
 
 
 def merge_pdfs(pdf_bytes_list):
@@ -82,15 +81,6 @@ def merge_pdfs(pdf_bytes_list):
 
 @app.route("/api/convert", methods=["POST"])
 def convert():
-    """
-    Main endpoint: Receives DOCX files + replacements, returns merged PDF.
-    
-    POST multipart/form-data:
-      - files: multiple DOCX files
-      - replacements: JSON string of {KEY: value}
-      - witness_name: filename stem to duplicate (default: "WITNESS")
-      - exclude_name: filename stem to skip (default: "CD")
-    """
     if not check_auth():
         return jsonify({"success": False, "message": "Unauthorized"}), 401
 
@@ -102,37 +92,42 @@ def convert():
         witness_stem = request.form.get("witness_name", "WITNESS").upper()
         exclude_stem = request.form.get("exclude_name", "CD").upper()
 
-        files = request.files.getlist("files")
+        # FIX: Collect all uploaded files regardless of field names (files, files[0], files[], etc.)
+        files = []
+        for key in request.files:
+            files.extend(request.files.getlist(key))
+
         if not files:
             return jsonify({"success": False, "message": "No files uploaded"}), 400
 
-        # Create temp workspace
         work_dir = tempfile.mkdtemp(prefix="ayra_pdf_")
 
         try:
             pdf_bytes_list = []
 
             for f in files:
-                stem = os.path.splitext(f.filename)[0].upper()
+                safe_filename = os.path.basename(f.filename)
+                stem = os.path.splitext(safe_filename)[0].upper()
 
-                # Skip excluded documents (like CD)
+                # Exclude CD
                 if stem == exclude_stem:
                     continue
 
-                # Save uploaded DOCX
-                docx_path = os.path.join(work_dir, f.filename)
+                # Save original DOCX
+                docx_path = os.path.join(work_dir, safe_filename)
                 f.save(docx_path)
 
                 # Fill template
-                filled_path = os.path.join(work_dir, f"filled_{f.filename}")
+                filled_filename = f"filled_{safe_filename}"
+                filled_path = os.path.join(work_dir, filled_filename)
                 fill_docx(docx_path, replacements, filled_path)
 
                 # Convert to PDF
-                pdf_filename = f"filled_{os.path.splitext(f.filename)[0]}.pdf"
+                pdf_filename = f"filled_{os.path.splitext(safe_filename)[0]}.pdf"
                 pdf_path = os.path.join(work_dir, pdf_filename)
                 convert_docx_to_pdf(filled_path, pdf_path)
 
-                # Read PDF bytes
+                # Read output PDF
                 with open(pdf_path, "rb") as pf:
                     pdf_data = pf.read()
 
@@ -143,9 +138,9 @@ def convert():
                     pdf_bytes_list.append(pdf_data)
 
             if not pdf_bytes_list:
-                return jsonify({"success": False, "message": "No PDFs generated"}), 500
+                return jsonify({"success": False, "message": "No PDFs could be generated"}), 500
 
-            # Merge all PDFs
+            # Merge all PDF pages into a single document
             merged = merge_pdfs(pdf_bytes_list)
 
             return send_file(
