@@ -49,11 +49,14 @@ def fill_docx(docx_path, replacements, output_path):
 
 
 def convert_docx_to_pdf(docx_path, pdf_path):
-    """Convert DOCX to PDF using LibreOffice headless in Docker"""
+    """Convert DOCX to PDF using LibreOffice with exact Microsoft fonts"""
     output_dir = os.path.dirname(pdf_path)
+    profile_dir = os.path.join(output_dir, "lo_profile")
+    os.makedirs(profile_dir, exist_ok=True)
+
     cmd = [
         "libreoffice",
-        "-env:UserInstallation=file:///tmp/lo_profile",
+        f"-env:UserInstallation=file://{profile_dir}",
         "--headless",
         "--norestore",
         "--nofirststartwizard",
